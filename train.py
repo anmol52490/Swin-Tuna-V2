@@ -1,8 +1,9 @@
-# train_final_optimized.py
+# train_final_corrected.py
 
 import os
 import logging
 from datetime import datetime
+import csv
 
 # --- Set Hugging Face cache directory ---
 cache_dir = "D:/huggingface_cache"
@@ -46,9 +47,10 @@ LEARNING_RATE = 0.00002
 WEIGHT_DECAY = 0.05
 LR_POWER = 0.9
 MAX_ITERATIONS = 100000
-EVAL_INTERVAL = 1000
+EVAL_INTERVAL = 10
 CHECKPOINT_DIR = "./sota_checkpoints"
 LOG_FILE = "training_log.txt"
+CSV_LOG_FILE = "training_metrics.csv"
 
 # --- TRANSFORMS ---
 CROP_PRE_SIZE = int(IMG_SIZE * 1.25)
@@ -71,44 +73,33 @@ val_transform = A.Compose([
 # --- DATASET & MODEL DEFINITION ---
 class FoodSegPyTorchDataset(Dataset):
     def __init__(self, hf_dataset, transform=None, is_preprocessed=False):
-        self.hf_dataset = hf_dataset
-        self.transform = transform
-        self.is_preprocessed = is_preprocessed
+        self.hf_dataset = hf_dataset; self.transform = transform; self.is_preprocessed = is_preprocessed
     def __len__(self): return len(self.hf_dataset)
     def __getitem__(self, idx):
         example = self.hf_dataset[idx]
         if self.is_preprocessed:
-            image_data = example['pixel_values']
-            label_data = example['label']
-            image = image_data
-            label = label_data
+            image = np.asarray(example['pixel_values'], dtype=np.float32)
+            label = example['label']
         else:
-            image_data = np.array(example['image'])
-            label_data = np.array(example['label'])
-            image = np.array(image_data, dtype=np.float32)
-            label = np.array(label_data, dtype=np.uint8)
-
+            image = np.array(example['image'], dtype=np.float32)
+            label = np.array(example['label'], dtype=np.uint8)
         if self.transform:
-            transformed = self.transform(image=image, mask=label)
-            image = transformed['image']
-            label = transformed['mask'].long()
+            transformed = self.transform(image=image, mask=np.asarray(label, dtype=np.uint8))
+            image = transformed['image']; label = transformed['mask'].long()
         return image, label
 
 def apply_pre_transform(batch):
     transformed_batch = {'pixel_values': [], 'label': []}
     for img, lbl in zip(batch['image'], batch['label']):
         transformed = pre_transform(image=np.array(img), mask=np.array(lbl))
-        transformed_batch['pixel_values'].append(transformed['image'])
-        transformed_batch['label'].append(transformed['mask'])
+        transformed_batch['pixel_values'].append(transformed['image']); transformed_batch['label'].append(transformed['mask'])
     return transformed_batch
-
+    
 def apply_val_transform_for_cache(batch):
-    """Applies the complete validation transform for caching."""
     transformed_batch = {'pixel_values': [], 'label': []}
     for img, lbl in zip(batch['image'], batch['label']):
         transformed = val_transform(image=np.array(img), mask=np.array(lbl))
-        transformed_batch['pixel_values'].append(transformed['image'])
-        transformed_batch['label'].append(transformed['mask'].long())
+        transformed_batch['pixel_values'].append(transformed['image']); transformed_batch['label'].append(transformed['mask'].long())
     return transformed_batch
 
 def tuna_swin_v2_block_forward_definitive(self, x):
@@ -159,27 +150,19 @@ def main():
 
     logging.info("="*50)
     logging.info(f"Starting new training run at {datetime.now()}")
-    logging.info(f"Configuration: BATCH_SIZE={BATCH_SIZE}, MAX_ITERATIONS={MAX_ITERATIONS}, LR={LEARNING_RATE}")
     
-    print("--- Loading Hugging Face dataset ---")
     ds = load_dataset("EduardoPacheco/FoodSeg103")
     
-    print(f"\n--- Applying one-time pre-processing transform to TRAIN set with {NUM_WORKERS} processes ---")
-    processed_train_ds = ds['train'].map(apply_pre_transform, batched=True, batch_size=100, num_proc=NUM_WORKERS, remove_columns=['image', 'id', 'classes_on_image'])
-    
-    # --- OPTIMIZATION 1: Pre-process and cache the validation set ---
-    print(f"\n--- Applying one-time pre-processing transform to VALIDATION set with {NUM_WORKERS} processes ---")
-    processed_val_ds = ds['validation'].map(apply_val_transform_for_cache, batched=True, batch_size=100, num_proc=NUM_WORKERS, remove_columns=['image', 'id', 'classes_on_image'])
-    processed_val_ds.set_format('torch') # Set format to PyTorch tensors for direct use
+    processed_train_ds = ds['train'].map(apply_pre_transform, batched=True, batch_size=100, num_proc=NUM_WORKERS, remove_columns=['image', 'id', 'classes_on_image'], new_fingerprint="foodseg103_train_preprocessed_v1")
+    processed_val_ds = ds['validation'].map(apply_val_transform_for_cache, batched=True, batch_size=100, num_proc=NUM_WORKERS, remove_columns=['image', 'id', 'classes_on_image'], new_fingerprint="foodseg103_val_preprocessed_v1")
+    processed_val_ds.set_format('torch')
     
     train_pytorch_dataset = FoodSegPyTorchDataset(processed_train_ds, transform=train_transform_random, is_preprocessed=True)
-    val_pytorch_dataset = FoodSegPyTorchDataset(processed_val_ds, transform=None, is_preprocessed=True) # No on-the-fly transform needed
+    val_pytorch_dataset = FoodSegPyTorchDataset(processed_val_ds, transform=None, is_preprocessed=True)
     
     train_dataloader = DataLoader(train_pytorch_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True)
     val_dataloader = DataLoader(val_pytorch_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True)
-    print(f"\nDataLoaders created with Batch Size: {BATCH_SIZE} and Num Workers: {NUM_WORKERS}")
-
-    print("\n--- Building and setting up the SOTA Model ---")
+    
     model_name = "swinv2_large_window12to24_192to384"
     backbone = timm.create_model(model_name, pretrained=True, features_only=True, out_indices=(0, 1, 2, 3), img_size=IMG_SIZE)
     inject_tuna_into_timm_swinv2(backbone)
@@ -200,8 +183,14 @@ def main():
 
     logging.info("\n--- Starting SOTA Training Run ---")
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    
+    # --- MODIFICATION: Initialize best_miou to track performance ---
     best_miou = 0.0
     train_iter = iter(train_dataloader)
+    
+    csv_file = open(CSV_LOG_FILE, 'w', newline='')
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(['iteration', 'train_loss', 'learning_rate', 'validation_loss', 'validation_miou'])
     
     for i in tqdm(range(MAX_ITERATIONS), desc="Total Iterations"):
         model.train()
@@ -226,50 +215,55 @@ def main():
         scheduler.step()
         optimizer.zero_grad()
         
-        if (i + 1) % 100 == 0:
-            current_lr = scheduler.get_last_lr()[0]
-            logging.info(f"Iter {i+1}/{MAX_ITERATIONS} | Train Loss: {loss.item():.4f} | LR: {current_lr:.6f}")
+        current_lr = scheduler.get_last_lr()[0]
+        log_row = [i + 1, f"{loss.item():.4f}", f"{current_lr:.6f}", "", ""]
         
         if (i + 1) % EVAL_INTERVAL == 0:
             model.eval()
             miou_metric.reset()
             val_progress_bar = tqdm(val_dataloader, desc=f"Iter {i+1} [Validation]", leave=False)
+            total_val_loss = 0.0
             
-            # --- OPTIMIZATION 2: UPGRADED VALIDATION LOOP WITH TTA ---
             with torch.no_grad():
                 for val_images, val_masks in val_progress_bar:
                     val_images, val_masks = val_images.to(DEVICE), val_masks.to(DEVICE)
+                    val_masks = val_masks.long()
+                    if val_masks.ndim == 4 and val_masks.shape[1] == 1:
+                        val_masks = val_masks.squeeze(1)
                     
                     with torch.cuda.amp.autocast(enabled=(DEVICE == "cuda")):
-                        # 1. Forward pass on original images
                         outputs_original = model(val_images)
                         outputs_original = nn.functional.interpolate(outputs_original, size=val_masks.shape[-2:], mode='bilinear', align_corners=False)
-                        
-                        # 2. Forward pass on horizontally flipped images
+                        val_loss = criterion(outputs_original, val_masks)
+                        total_val_loss += val_loss.item()
                         outputs_flipped = model(torch.flip(val_images, dims=[3]))
                         outputs_flipped = nn.functional.interpolate(outputs_flipped, size=val_masks.shape[-2:], mode='bilinear', align_corners=False)
                     
-                    # 3. Flip predictions back to original orientation
                     outputs_flipped_restored = torch.flip(outputs_flipped, dims=[3])
-                    
-                    # 4. Average the probabilities
                     final_outputs_prob = (torch.softmax(outputs_original, dim=1) + torch.softmax(outputs_flipped_restored, dim=1)) / 2.0
-                    
-                    # 5. Get final prediction from averaged probabilities
                     preds = torch.argmax(final_outputs_prob, dim=1)
                     miou_metric.update(preds, val_masks)
 
             miou = miou_metric.compute()
-            logging.info(f"--- VALIDATION (TTA) --- Iter {i+1}/{MAX_ITERATIONS} -> Validation mIoU: {miou:.4f} ---")
+            avg_val_loss = total_val_loss / len(val_dataloader)
             
+            log_row[3] = f"{avg_val_loss:.4f}"
+            log_row[4] = f"{miou:.4f}"
+            
+            logging.info(f"--- VALIDATION (TTA) --- Iter {i+1}/{MAX_ITERATIONS} -> Val Loss: {avg_val_loss:.4f} | Val mIoU: {miou:.4f} ---")
+            
+            # --- MODIFICATION: Save only the best model with a meaningful name ---
             if miou > best_miou:
                 best_miou = miou
                 checkpoint_path = os.path.join(CHECKPOINT_DIR, f"sota_model_best_iter_{i+1}_miou_{miou:.4f}.pth")
                 torch.save(model.state_dict(), checkpoint_path)
                 logging.info(f"🚀 New best model saved to {checkpoint_path} with mIoU: {best_miou:.4f}")
+        
+        csv_writer.writerow(log_row)
+        csv_file.flush()
 
     logging.info("\n--- Training Complete ---")
-    logging.info(f"Best Validation mIoU achieved: {best_miou:.4f}")
+    csv_file.close()
 
 if __name__ == '__main__':
     main()
